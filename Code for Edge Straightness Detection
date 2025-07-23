@@ -1,0 +1,146 @@
+import os
+import numpy as np
+from PIL import Image
+import csv
+import cv2
+from sklearn.linear_model import LinearRegression
+
+# Paths
+image_folder = 'binaryImages/edges'
+output_csv_folder = 'output_csvs'
+output_img_folder = 'output_visuals'
+os.makedirs(output_csv_folder, exist_ok=True)
+os.makedirs(output_img_folder, exist_ok=True)
+
+# Process images
+for filename in os.listdir(image_folder):
+    if filename.lower().endswith('.tif'):
+        image_path = os.path.join(image_folder, filename)
+        print(f"Processing {filename}...")
+
+        # Load and preprocess
+        img = Image.open(image_path).convert('L')
+        width, height = img.size
+        if width < height:
+            print("Rotating image 90 degrees.")
+            img = img.rotate(90, expand=True)
+
+        img_array = np.array(img)
+
+        # Apply binary thresholding
+        _, binary = cv2.threshold(img_array, 127, 255, cv2.THRESH_BINARY)
+
+        # --- Noise filtering using morphological opening ---
+        kernel = np.ones((3, 3), np.uint8)
+        filtered = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel)
+
+        height, width = filtered.shape
+        black_pixel_counts = []
+        line_positions = []
+        deviations = []
+        x_vals = []
+        y_vals = []
+
+        # Analyze each column
+        for col in range(width):
+            column = filtered[:, col]
+            black_pixel_count = np.sum(column == 0)
+            black_pixel_counts.append(black_pixel_count)
+
+            # Detect topmost black pixel
+            black_indices = np.where(column == 0)[0]
+            if black_indices.size > 0:
+                y_top = black_indices[0]
+            else:
+                y_top = np.nan
+
+            line_positions.append(y_top)
+
+            if not np.isnan(y_top):
+                x_vals.append(col)
+                y_vals.append(y_top)
+
+        # Fit linear regression
+        x_vals_np = np.array(x_vals).reshape(-1, 1)
+        y_vals_np = np.array(y_vals)
+        model = LinearRegression().fit(x_vals_np, y_vals_np)
+        y_pred = model.predict(x_vals_np)
+        residuals = y_vals_np - y_pred
+        std_deviation = np.std(residuals)
+
+        # Store deviations per column
+        for col in range(width):
+            if col in x_vals:
+                idx = x_vals.index(col)
+                deviations.append(residuals[idx])
+            else:
+                deviations.append(np.nan)
+
+        # Write CSV
+        base_name = os.path.splitext(filename)[0]
+        csv_file = os.path.join(output_csv_folder, f'{base_name}_line_analysis.csv')
+        with open(csv_file, mode='w', newline='') as file:
+            writer = csv.writer(file)
+            writer.writerow(['Column', 'Black Pixels', 'Line_Y_Position', 'Deviation_From_LinearFit'])
+            for col in range(width):
+                writer.writerow([col,
+                                 black_pixel_counts[col],
+                                 line_positions[col] if not np.isnan(line_positions[col]) else '',
+                                 deviations[col] if not np.isnan(deviations[col]) else ''])
+            writer.writerow([])
+            writer.writerow(['Straightness_STD', std_deviation])
+
+        print(f"Saved CSV: {csv_file}")
+
+        # === High-resolution visualization ===
+        scale = 4
+        filtered_hr = cv2.resize(filtered, (width * scale, height * scale), interpolation=cv2.INTER_NEAREST)
+        visual = cv2.cvtColor(filtered_hr, cv2.COLOR_GRAY2BGR)
+
+        # Scale coordinates
+        x_vals_scaled = [x * scale for x in x_vals]
+        y_vals_scaled = [int(y * scale) for y in y_vals]
+        y_pred_scaled = [int(y * scale) for y in y_pred]
+
+        # Draw red detection points
+        for x, y in zip(x_vals_scaled, y_vals_scaled):
+            cv2.circle(visual, (x, y), 3, (0, 0, 255), -1)
+
+        # Draw transparent green regression base
+        overlay = visual.copy()
+        for x, y in zip(x_vals_scaled, y_pred_scaled):
+            cv2.circle(overlay, (x, y), 2, (0, 255, 0), -1)
+        cv2.addWeighted(overlay, 0.3, visual, 0.7, 0, visual)
+
+        # Draw solid green regression line on top
+        for i in range(len(x_vals_scaled) - 1):
+            pt1 = (x_vals_scaled[i], y_pred_scaled[i])
+            pt2 = (x_vals_scaled[i + 1], y_pred_scaled[i + 1])
+            cv2.line(visual, pt1, pt2, (0, 255, 0), 3)
+
+        # Dashed grid lines
+        for y in range(0, visual.shape[0], 50):
+            for x in range(0, visual.shape[1], 20):
+                if (x // 20) % 2 == 0:
+                    cv2.line(visual, (x, y), (x + 10, y), (220, 220, 220), 1)
+
+        # Add footer for annotation
+        footer_height = 60
+        canvas = np.ones((visual.shape[0] + footer_height, visual.shape[1], 3), dtype=np.uint8) * 255
+        canvas[:visual.shape[0], :, :] = visual
+
+        text = f'Straightness STD: {std_deviation:.2f}'
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        font_scale = 1.2
+        thickness = 2
+        text_size, _ = cv2.getTextSize(text, font, font_scale, thickness)
+        text_x = (canvas.shape[1] - text_size[0]) // 2
+        text_y = visual.shape[0] + (footer_height + text_size[1]) // 2
+        cv2.putText(canvas, text, (text_x, text_y), font, font_scale, (0, 0, 0), thickness, cv2.LINE_AA)
+
+        # Save final image
+        out_img_path = os.path.join(output_img_folder, f"{base_name}_visual.png")
+        cv2.imwrite(out_img_path, canvas)
+        print(f"Saved annotated image: {out_img_path}")
+
+print("Processing complete.")
