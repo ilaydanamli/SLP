@@ -1,0 +1,68 @@
+
+import os
+import cv2
+import numpy as np
+
+# Paths
+input_folder = ' 
+output_folder = 'output_corners'
+os.makedirs(output_folder, exist_ok=True)
+
+# Process each .tif image
+for filename in os.listdir(input_folder):
+    if filename.lower().endswith('.tif'):
+        image_path = os.path.join(input_folder, filename)
+        print(f"Processing: {filename}")
+
+        # Load and convert to color
+        original_gray = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
+        image_color = cv2.cvtColor(original_gray, cv2.COLOR_GRAY2BGR)
+
+        # Threshold to binary
+        _, binary = cv2.threshold(original_gray, 127, 255, cv2.THRESH_BINARY)
+
+        # Dilate to fill small gaps
+        kernel = np.ones((3, 3), np.uint8)
+        dilated = cv2.dilate(binary, kernel, iterations=1)
+
+        # Find contours
+        contours, _ = cv2.findContours(dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if len(contours) == 0:
+            print("No contours found.")
+            continue
+
+        # Bounding box
+        x, y, w, h = cv2.boundingRect(np.vstack(contours))
+
+        # Calculate percentage of white pixels inside bounding box
+        rect_area = w * h
+        white_area = cv2.countNonZero(dilated[y:y+h, x:x+w])
+        percentage = (white_area / rect_area) * 100
+        percentage_text = f"{percentage:.2f}%"
+
+        # Draw red rectangle
+        cv2.rectangle(image_color, (x, y), (x + w, y + h), (0, 0, 255), 2)
+
+        # Get center of the rectangle
+        center_x = x + w // 2
+        center_y = y + h // 2
+
+        # Put even smaller percentage text at the center of the rectangle
+        font_scale = 0.35
+        thickness = 1
+        text_size, _ = cv2.getTextSize(percentage_text, cv2.FONT_HERSHEY_SIMPLEX, font_scale, thickness)
+        text_x = center_x - text_size[0] // 2
+        text_y = center_y + text_size[1] // 2
+        cv2.putText(image_color, percentage_text, (text_x, text_y),
+                    cv2.FONT_HERSHEY_SIMPLEX, font_scale, (0, 0, 255), thickness)
+
+        # Save with percentage in filename
+        percent_str_for_filename = percentage_text.replace('.', '_').replace('%', '')
+        base_name = os.path.splitext(filename)[0]
+        output_filename = f"{base_name}_{percent_str_for_filename}percent.png"
+        output_path = os.path.join(output_folder, output_filename)
+
+        cv2.imwrite(output_path, image_color)
+        print(f"Saved result to: {output_path}")
+
+print("All images processed.")
