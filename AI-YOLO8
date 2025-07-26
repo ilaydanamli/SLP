@@ -1,0 +1,304 @@
+import cv2
+import numpy as np
+from ultralytics import YOLO
+from pathlib import Path
+from scipy.ndimage import gaussian_filter1d
+from collections import deque, Counter
+import csv
+import colorsys
+
+# ========================
+# === CONFIGURATION  ====
+# ========================
+
+# Tracking parameters
+MAX_DISTANCE = 70         # Maximum pixel distance to match detections between frames
+MAX_MISSES = 10           # How many frames a cell can disappear before we stop tracking it
+MIN_MASK_AREA = 700       # Minimum area for a detected mask to be considered a real cell
+
+# Visualization parameters
+FRAME_DELAY = 2000        # Delay in ms for displaying each frame (use smaller for real‑time)
+FONT_SCALE = 0.6
+FONT_THICKNESS = 1
+TRAIL_THICKNESS = 3
+TRAIL_LENGTH = 50
+SHOW_VIDEO = True         # Whether to show frames as they are processed
+SHOW_ELLIPSES = True      # Draw fitted ellipses on each cell to show orientation
+
+# Trail smoothing and style
+SMOOTHING_WINDOW = 5
+GAUSSIAN_SIGMA = 1.0
+TRAIL_ALPHA_DECAY = 0.8
+MIN_MOVEMENT_THRESHOLD = 2
+USE_GRADIENT_TRAILS = True
+CELL_CIRCLE_RADIUS = 6
+SHADOW_OFFSET = 2         # Offset for shadow effect under each cell marker
+
+# YOLO model settings
+YOLO_IMAGE_SIZE = 640
+YOLO_CONFIDENCE = 0.6
+
+# ------------------------
+# File paths (set these!)
+VIDEO_INPUT_DIR  = Path("path/to/your/input/videos")
+VIDEO_OUTPUT_DIR = Path("path/to/your/output/videos")
+MODEL_PATH       = Path("path/to/your/yolov8-model.pt")
+VIDEO_OUTPUT_DIR.mkdir(exist_ok=True)
+
+
+# ==========================
+# === HELPER FUNCTIONS  ====
+# ==========================
+
+def generate_distinct_color(id):
+    """Generate a reproducible, distinct color for each track ID."""
+    np.random.seed(id)
+    hue = (id * 137.508) % 360
+    sat = 0.7 + (id % 3) * 0.1
+    val = 0.8 + (id % 2) * 0.2
+    r, g, b = colorsys.hsv_to_rgb(hue/360, sat, val)
+    return (int(b*255), int(g*255), int(r*255))
+
+def smooth_path(points, window_size=5, sigma=1.0):
+    """Apply a Gaussian filter to smooth a list of (x, y) points."""
+    if len(points) < window_size:
+        return points
+    arr = np.array(points, dtype=float)
+    sx = gaussian_filter1d(arr[:,0], sigma=sigma)
+    sy = gaussian_filter1d(arr[:,1], sigma=sigma)
+    return [(int(x), int(y)) for x,y in zip(sx, sy)]
+
+def draw_gradient_trail(frame, trail, color):
+    """Draw a fading trail behind each cell."""
+    overlay = frame.copy()
+    for i in range(1, len(trail)):
+        alpha = (i / len(trail)) ** TRAIL_ALPHA_DECAY
+        col = tuple(int(c * alpha) for c in color)
+        thickness = max(1, int(TRAIL_THICKNESS * alpha))
+        cv2.line(overlay, trail[i-1], trail[i], col, thickness)
+    cv2.addWeighted(overlay, 0.7, frame, 0.3, 0, frame)
+
+def draw_cell_with_shadow(frame, center, radius, color):
+    """Draw a cell marker with shadow and border."""
+    cx, cy = center
+    cv2.circle(frame, (cx+SHADOW_OFFSET, cy+SHADOW_OFFSET), radius, (50,50,50), -1)
+    cv2.circle(frame, (cx, cy), radius, color, -1)
+    cv2.circle(frame, (cx, cy), radius, (255,255,255), 1)
+
+def compute_orientation(mask):
+    """Fit an ellipse to the largest contour and return its angle."""
+    contours, _ = cv2.findContours(mask.astype(np.uint8),
+                                   cv2.RETR_EXTERNAL,
+                                   cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return None, None
+    cnt = max(contours, key=cv2.contourArea)
+    if len(cnt) < 5:
+        return None, None
+    ellipse = cv2.fitEllipse(cnt)
+    return ellipse[2], ellipse
+
+def categorize_direction(angle):
+    """Convert angle to one of four direction labels."""
+    if angle is None:
+        return 'Undefined'
+    if angle < 22.5 or angle >= 157.5:
+        return 'Horizontal (E–W)'
+    if angle < 67.5:
+        return 'Diagonal 45° (NE–SW)'
+    if angle < 112.5:
+        return 'Vertical (N–S)'
+    return 'Diagonal 135° (NW–SE)'
+
+
+# =================================
+# === TRACK CLASS FOR EACH CELL ===
+# =================================
+
+class Track:
+    """Holds tracking history and stats for a single cell."""
+    def __init__(self, id, centroid):
+        self.id = id
+        self.centroid = centroid
+        self.color = generate_distinct_color(id)
+        self.misses = 0
+        self.raw_history = deque(maxlen=TRAIL_LENGTH*2)
+        self.smoothed_history = deque(maxlen=TRAIL_LENGTH)
+        self.last_point = None
+        self.angles = []
+        self.centroid_history = []
+        self.frames_seen = 0
+        self.direction = None
+
+    def update_position(self, new_centroid):
+        """Update position, smooth path, and record history."""
+        self.centroid = new_centroid
+        self.centroid_history.append(new_centroid)
+        self.raw_history.append(new_centroid)
+
+        moved = (self.last_point is None or
+                 np.linalg.norm(np.array(new_centroid)-np.array(self.last_point)) > MIN_MOVEMENT_THRESHOLD)
+        if moved and len(self.raw_history) >= SMOOTHING_WINDOW:
+            smooth_pts = smooth_path(list(self.raw_history), SMOOTHING_WINDOW, GAUSSIAN_SIGMA)
+            self.smoothed_history.append(smooth_pts[-1])
+            self.last_point = new_centroid
+
+
+# =====================================
+# === MATCHING & FILTERING UTILITIES ==
+# =====================================
+
+def euclidean(a, b):
+    """Compute Euclidean distance between two points."""
+    return np.linalg.norm(np.array(a) - np.array(b))
+
+def match_tracks(tracks, centroids):
+    """
+    Match existing tracks to new centroids, update or create tracks.
+    """
+    updated = []
+    assigned = set()
+
+    # match existing
+    for t in tracks:
+        best, idx = float('inf'), -1
+        for i, c in enumerate(centroids):
+            if i in assigned:
+                continue
+            d = euclidean(t.centroid, c)
+            if d < best and d < MAX_DISTANCE:
+                best, idx = d, i
+        if idx >= 0:
+            t.update_position(centroids[idx])
+            t.misses = 0
+            updated.append(t)
+            assigned.add(idx)
+        else:
+            t.misses += 1
+            if t.misses <= MAX_MISSES:
+                updated.append(t)
+
+    # new tracks
+    next_id = max((t.id for t in updated), default=-1) + 1
+    for i, c in enumerate(centroids):
+        if i not in assigned:
+            new_t = Track(next_id, c)
+            new_t.update_position(c)
+            updated.append(new_t)
+            next_id += 1
+
+    return updated
+
+def get_centroids_and_masks(masks, frame_shape, min_area):
+    """
+    Resize masks, filter by area, and compute centroids.
+    """
+    cents, filtered = [], []
+    for m in masks:
+        resized = cv2.resize(m.astype(np.uint8),
+                             (frame_shape[1], frame_shape[0]),
+                             interpolation=cv2.INTER_NEAREST)
+        if resized.sum() >= min_area:
+            ys, xs = np.where(resized)
+            x1, y1 = xs.min(), ys.min()
+            x2, y2 = xs.max(), ys.max()
+            cents.append(((x1+x2)//2, (y1+y2)//2))
+            filtered.append(resized)
+    return cents, filtered
+
+def add_info_panel(frame, idx, count):
+    """Draw frame index and cell count panel."""
+    overlay = frame.copy()
+    cv2.rectangle(overlay, (10,10), (310,90), (0,0,0), -1)
+    cv2.addWeighted(overlay, 0.7, frame, 0.3, 0, frame)
+    cv2.rectangle(frame, (10,10), (310,90), (100,100,100), 2)
+    cv2.putText(frame, f"Frame: {idx}", (20,40),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,255), 2)
+    cv2.putText(frame, f"Cells: {count}", (20,70),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,255), 2)
+
+
+# ===================
+# === MAIN SCRIPT ===
+# ===================
+
+model = YOLO(str(MODEL_PATH))
+video_files = list(VIDEO_INPUT_DIR.glob("*.mp4"))
+
+for video_path in video_files:
+    cap = cv2.VideoCapture(str(video_path))
+    w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30
+
+    writer = cv2.VideoWriter(
+        str(VIDEO_OUTPUT_DIR / f"tracked_{video_path.name}"),
+        cv2.VideoWriter_fourcc(*'mp4v'),
+        fps, (w, h)
+    )
+
+    tracks = []
+    dir_counts = Counter()
+    frame_i = 0
+
+    while cap.isOpened():
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        # segmentation
+        res = model(frame, imgsz=YOLO_IMAGE_SIZE, conf=YOLO_CONFIDENCE, verbose=False)[0]
+        masks = res.masks.data.cpu().numpy() if res.masks else []
+
+        # extract centroids
+        cents, filt = get_centroids_and_masks(masks, frame.shape, MIN_MASK_AREA)
+
+        # update tracks
+        tracks = match_tracks(tracks, cents)
+        active = [t for t in tracks if t.misses == 0]
+
+        # analyze & draw
+        for t, m in zip(active, filt):
+            t.frames_seen += 1
+            angle, ell = compute_orientation(m)
+            if angle is not None:
+                t.angles.append(angle)
+            if SHOW_ELLIPSES and ell:
+                cv2.ellipse(frame, ell, t.color, 2)
+            if t.direction is None and t.angles:
+                t.direction = categorize_direction(t.angles[0])
+                dir_counts[t.direction] += 1
+
+        for t in active:
+            if len(t.smoothed_history) > 1:
+                if USE_GRADIENT_TRAILS:
+                    draw_gradient_trail(frame, t.smoothed_history, t.color)
+                else:
+                    for i in range(1, len(t.smoothed_history)):
+                        cv2.line(frame, t.smoothed_history[i-1], t.smoothed_history[i], t.color, TRAIL_THICKNESS)
+
+            draw_cell_with_shadow(frame, tuple(map(int, t.centroid)), CELL_CIRCLE_RADIUS, t.color)
+            lbl = f"Cell {t.id}"
+            sz = cv2.getTextSize(lbl, cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, FONT_THICKNESS)[0]
+            cv2.rectangle(frame, (t.centroid[0]+8, t.centroid[1]-20),
+                          (t.centroid[0]+15+sz[0], t.centroid[1]-5), (0,0,0), -1)
+            cv2.rectangle(frame, (t.centroid[0]+8, t.centroid[1]-20),
+                          (t.centroid[0]+15+sz[0], t.centroid[1]-5), t.color, 1)
+            cv2.putText(frame, lbl, (t.centroid[0]+10, t.centroid[1]-8),
+                        cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, (255,255,255), FONT_THICKNESS)
+
+        add_info_panel(frame, frame_i, len(active))
+        writer.write(frame)
+
+        if SHOW_VIDEO and cv2.waitKey(FRAME_DELAY) & 0xFF == ord('q'):
+            break
+
+        frame_i += 1
+
+    cap.release()
+    writer.release()
+
+    # save reports...
+    # (same as before)
+
+cv2.destroyAllWindows()
